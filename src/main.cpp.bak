@@ -1,0 +1,535 @@
+#include <iostream>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <fstream>
+
+#include "wallet/monero_wallet_full.h"
+#include "utils/monero_utils.h"
+
+using namespace monero;
+
+static void print_help()
+{
+    std::cout <<
+    "moneta usage:\n"
+    "  -w <wallet> <password>     	wallet file\n"
+    "  -cw <wallet> <password>    	create wallet\n"
+    "  -ca <label>         	  	create subaddress with label\n"
+    "  -a <range>          	  	address selection: 1 | 2:4 | 2,4\n"
+    "  -la                 	  	list created subaddresses\n"
+    "  -b                  	  	show balance\n"
+    "  -s <amount> <dest address> 	send/spend monero\n"
+    "  -tx <N>             	  	show tx history (0 for all)\n"
+    "  -c                  	  	clean output (CSV output)\n"
+    "  -h, --help          	  	show help\n";
+    "  -cfg				config file\n";
+}
+
+struct BalanceInfo
+{
+	uint64_t balance;
+	uint64_t unlocked;
+};
+
+struct AddressInfo
+{
+	std::string address;
+	std::string label;
+};
+
+struct TransferInfo
+{
+	uint64_t amount;
+};
+
+struct TxInfo
+{
+	std::string hash;
+	bool incoming;
+    	uint64_t fee;
+    	uint64_t height;
+	std::vector<TransferInfo> transfers;
+};
+
+static std::vector<uint32_t> parse_indices(const std::string& input)
+{
+	std::vector<uint32_t> out;
+
+	if (input.find(':') != std::string::npos)
+    	{
+        	size_t pos = input.find(':');
+        	int a = std::stoi(input.substr(0, pos));
+        	int b = std::stoi(input.substr(pos + 1));
+
+        	for (int i = a; i <= b; i++)
+        		out.push_back(i);
+	}
+    	else if (input.find(',') != std::string::npos)
+    	{
+        	std::stringstream ss(input);
+        	std::string item;
+
+        	while (std::getline(ss, item, ','))
+            		out.push_back(std::stoi(item));
+    	}
+    	else
+    	{
+        	out.push_back(std::stoi(input));
+    	}
+
+    	return out;
+}
+
+// Checks if the file exists & is readable
+static bool file_exists(const std::string& path)
+{
+    	std::ifstream f(path);
+    	return f.good();
+}
+
+
+// Returns correct path or nothing if specified & not existant
+static std::string find_config(std::string& config_path)
+{
+	if (!config_path.empty())
+	{
+		if (file_exists(config_path))
+			return config_path;
+	
+		std::cerr << "Specified config file not found or not readable \n";
+		return "";
+	}
+
+	if (file_exists("moneta.conf"))
+		return "moneta.conf";
+
+	const char* home = std::getenv("HOME");
+	if (home)
+	{
+		std::string home_path(home);
+		config_path = home_path + "/.config/moneta.conf";
+		if (file_exists(config_path))
+			return config_path;
+		config_path = home_path + "/.config/moneta/moneta.conf";
+		if (file_exists(config_path))
+			return config_path;
+	}
+	return "";
+}
+
+
+static void print_addresses(monero_wallet_full* wallet,
+                            const std::vector<uint32_t>& idx,
+                            bool script)
+{
+    auto subs = wallet->get_subaddresses(0, idx);
+
+    for (const auto& s : subs)
+    {
+        std::string label =
+            (s.m_label && !s.m_label->empty()) ? *s.m_label : "-";
+
+        if (script)
+        {
+            std::cout
+                << s.m_address << ","
+                << label << "\n";
+        }
+        else
+        {
+            std::cout
+                << s.m_address << "\n"
+                << label << "\n\n";
+        }
+    }
+}
+
+uint64_t to_piconero(const std::string& xmr_str)
+{
+    size_t dot = xmr_str.find('.');
+    
+    std::string integer_part;
+    std::string decimal_part;
+
+    if (dot == std::string::npos)
+    {
+        integer_part = xmr_str;
+        decimal_part = "";
+    }
+    else
+    {
+        integer_part = xmr_str.substr(0, dot);
+        decimal_part = xmr_str.substr(dot + 1);
+    }
+
+    // Pad or truncate decimal to exactly 12 digits
+    if (decimal_part.size() < 12)
+        decimal_part.append(12 - decimal_part.size(), '0');
+    else
+        decimal_part = decimal_part.substr(0, 12);
+
+    return std::stoull(integer_part + decimal_part);
+}
+
+double to_monero(uint64_t piconeros)
+{
+    return static_cast<double>(piconeros) / 1e12;
+}
+
+
+static void create_sub(monero_wallet_full* wallet, const std::string& label)
+{
+    wallet->create_subaddress(0, label);
+    wallet->sync();
+    wallet->save();
+}
+
+static void send_monero(monero_wallet_full* wallet, std::string address, std::string amount, bool script, bool relay=true)
+{
+	monero_tx_config config;
+
+	monero_destination dest;
+	dest.m_address = address;
+	dest.m_amount = to_piconero(amount);
+
+	std::shared_ptr<monero_destination> dest_ptr = std::make_shared<monero_destination>(dest);
+config.m_destinations.push_back(dest_ptr);
+
+	// set fee priority (0=default, 1=unimportant, 2=normal, 3=elevated, 4=priority)
+	config.m_priority = monero_tx_priority::NORMAL;
+	config.m_relay = relay;
+	config.m_account_index = 0;
+
+	try
+	{
+		auto txs = wallet->create_txs(config);
+
+		for (const auto& tx : txs)
+		{
+			std::string hash = tx->m_hash ? *tx->m_hash : "N/A";
+			uint64_t fee = tx->m_fee ? *tx->m_fee : 0;
+
+			if (!script)
+			{
+
+				std::cout << "TX: " << hash << "\n";
+				std::cout << "Fee" << to_monero(fee) << "\n";
+		
+			}
+			else std::cout << hash << "," << fee << "\n";
+		}
+
+
+		//free memory
+		monero_utils::free(txs);
+
+		
+		if (!relay)
+    			wallet->sync(); // clear state to allow just a check rather than tx creation
+	
+	}
+	catch (const std::exception& e)
+	{
+		std::cerr << "Error: " << e.what() << "\n";
+	}
+
+
+}
+
+static void list_created(monero_wallet_full* wallet, bool script)
+{
+    auto subs = wallet->get_subaddresses(0, {});
+
+    for (const auto& s : subs)
+    {
+        std::string label =
+            (s.m_label && !s.m_label->empty()) ? *s.m_label : "-";
+
+        if (script)
+        {
+            std::cout
+                << s.m_address << ","
+                << label << "\n";
+        }
+        else
+        {
+            std::cout
+                << s.m_address << "\n"
+                << label << "\n\n";
+        }
+    }
+}
+
+static void print_balance(monero_wallet_full* wallet, bool script)
+{
+    uint64_t balance = wallet->get_balance();
+    uint64_t unlocked = wallet->get_unlocked_balance();
+
+    if (script)
+    {
+        std::cout << balance << "," << unlocked << "\n";
+    }
+    else
+    {
+        std::cout << "Balance: " << to_monero(balance) << "\n";
+        std::cout << "Unlocked: " << to_monero(unlocked) << "\n";
+    }
+}
+
+static void print_tx_history(monero_wallet_full* wallet, int limit, bool script) {
+    auto txs = wallet->get_txs();
+
+    if (txs.empty()) {
+        return;
+    }
+
+    int count = 0;
+
+    for (auto &tx : txs) {
+        if (limit > 0 && count >= limit)
+            break;
+
+        std::string hash = tx->m_hash ? *tx->m_hash : "N/A";
+        uint64_t fee = tx->m_fee ? *tx->m_fee : 0;
+        bool incoming = tx->m_is_incoming ? *tx->m_is_incoming : false;
+
+        uint64_t height = 0;
+        auto height_opt = tx->get_height();
+        if (height_opt) height = *height_opt;
+	if (!script)
+	{
+		std::cout << "Tx Hash:   " << hash << "\n";
+		std::cout << "Direction: " << (incoming ? "IN" : "OUT") << "\n";
+		std::cout << "Fee:       " << to_monero(fee) << "\n";
+		std::cout << "Height:    " << height << "\n";
+	}
+	else
+	{
+		std::cout << hash << "," << incoming << "," << fee << "," << height << ",";
+	}
+        auto transfers = tx->get_transfers();
+
+	for (auto &t : transfers) {
+		uint64_t amount = t->m_amount ? *t->m_amount : 0;
+		if (!script)
+		{
+			std::cout << "\n" << "Transfer: " << static_cast<double>(amount) / 1e12 << "\n\n";
+		}
+		else
+		{
+			std::cout << amount << "\n";	
+		}
+	}
+
+        count++;
+    }
+}
+
+int main(int argc, char* argv[])
+{
+	std::cout << std::fixed << std::setprecision(12);
+    	std::string wallet_file = "";
+    	std::string password = "";
+	std::string dest;
+	std::string daemon;
+	// To prevent floating point errors
+	std::string amount;
+
+    	bool create_wallet_flag = false;
+    	bool create_sub_flag = false;
+    	bool list_all_flag = false;
+    	bool script_mode = false;
+    	bool balance_flag = false;
+	bool transfer_flag = false;
+	bool tx_flag = false;
+	std::string config_file; 
+
+    	int tx_limit = 0;
+
+    	std::vector<uint32_t> addr_idx;
+    	std::string ac_label;
+
+    	for (int i = 1; i < argc; i++)
+    	{
+        	std::string arg = argv[i];
+
+        	if (arg == "-w" && i + 1 < argc)
+        	{
+			if (argc < i + 2)
+			{
+				std::cerr << "Enter both a wallet file and password";
+			}
+			else
+			{
+				wallet_file = argv[++i];
+				password = argv[++i];
+			}
+        	}
+        	else if (arg == "-cw")
+        	{
+			if (argc < i + 2)
+			{
+				std::cerr << "Enter both a wallet file and password";
+			}
+			else
+			{
+				create_wallet_flag = true;
+				wallet_file = argv[++i];
+				password = argv[++i];
+			}
+        	}
+        	else if (arg == "-ca" && i + 1 < argc)
+        	{
+        		create_sub_flag = true;
+        		ac_label = argv[++i];
+        	}
+        	else if (arg == "-la")
+        	{
+        		list_all_flag = true;
+        	}
+		else if (arg == "-c")
+        	{
+        		script_mode = true;
+        	}
+		else if (arg == "-d")
+		{
+			if (argc > i)
+			{
+				daemon = argv[++i];
+			}
+		}
+        	else if (arg == "-a" && i + 1 < argc)
+        	{
+        		addr_idx = parse_indices(argv[++i]);
+        	}
+        	else if (arg == "-b")
+        	{
+            		balance_flag = true;
+        	}
+		else if (arg == "-s")
+		{
+			if (i + 2 < argc)
+			{
+				amount = argv[++i];
+				dest = argv[++i];
+				transfer_flag=true;
+			}
+			else std::cerr << "Please enter amount and destination\n";
+		}
+        	else if (arg == "-tx")
+        	{
+			tx_flag = true;
+			if (argc > i)
+			{
+				try
+				{
+					tx_limit = std::stoi(argv[++i]);
+				}
+				catch (const std::exception&)
+				{
+					tx_limit = 0;
+				}
+			}
+        	}
+        	else if (arg == "-h" || arg == "--help")
+        	{
+        		print_help();
+        		return 0;
+        	}
+		else if (arg == "-cfg")
+		{
+			if (argc > i)
+			{
+				config_file = argv[++i];
+			}
+		}
+    	}
+
+    	try
+    	{
+		config_file = find_config(config_file);
+        	monero_wallet_full* wallet = nullptr;
+		if (!config_file.empty())
+		{
+    			std::ifstream conf;
+    			conf.open(config_file);
+
+		if (!conf.is_open())
+		{
+			std::cerr << "Could not open config file: " << config_file << "\n";
+		}
+		else
+		{
+			std::string line;
+			while (std::getline(conf, line))
+			{
+			    	size_t eq = line.find('=');
+			    	if (eq == std::string::npos)
+					continue;
+
+			    	std::string key = line.substr(0, eq);
+			    	std::string val = line.substr(eq + 1);
+
+			    	if (key == "wallet" && wallet_file.empty())   wallet_file = val;
+			    	if (key == "password" && password.empty()) password = val;
+			    	if (key == "daemon" && daemon.empty()) daemon = val;
+			}
+
+			conf.close();
+		    }
+		}
+
+
+		if (password.empty())
+			password = "password";
+		if (wallet_file.empty())
+			wallet_file = "monero_wallet";
+		if (daemon.empty())
+			daemon = "http://127.0.0.1:18081";
+
+		monero_wallet_config cfg;
+        	cfg.m_network_type = monero_network_type::MAINNET;
+        	cfg.m_password = password;
+        	cfg.m_path = wallet_file;
+        	cfg.m_server = monero_rpc_connection(daemon);
+
+        	if (create_wallet_flag)
+            		wallet = monero_wallet_full::create_wallet(cfg);
+        	else
+            		wallet = monero_wallet_full::open_wallet(wallet_file, password, monero_network_type::MAINNET);
+
+        	wallet->set_daemon_connection(cfg.m_server);
+	
+		wallet->sync();
+		wallet->save();
+        	if (create_sub_flag)
+            		create_sub(wallet, ac_label);
+
+        	if (list_all_flag)
+            		list_created(wallet, script_mode);
+
+        	if (!addr_idx.empty())
+            		print_addresses(wallet, addr_idx, script_mode);
+
+        	if (balance_flag)
+            		print_balance(wallet, script_mode);
+
+        	if (tx_flag)
+           		print_tx_history(wallet, tx_limit, script_mode);
+    		
+		if (transfer_flag)
+			send_monero(wallet, dest, amount, script_mode);
+		
+		if (!script_mode) 
+			std::cout << "\n";
+
+
+	}
+	catch (const std::exception& e)
+    	{
+        	std::cerr << e.what() << "\n";
+    	}
+
+    	return 0;
+}
