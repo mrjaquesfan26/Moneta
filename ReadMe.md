@@ -16,7 +16,7 @@ yay -S --needed base-devel cmake pkgconf openssl zeromq libsodium unbound \
 
 ```bash
 git clone <repo-url>
-cd moneta
+cd Moneta
 ```
 
 Build external dependencies:
