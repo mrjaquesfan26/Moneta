@@ -38,6 +38,17 @@ cmake .. -DMONETA_TUI=ON        # OFF to build without the TUI
 make -j$(nproc)                 # same WSL warning as above
 ```
 
+## Configuration
+
+Pass a config file with `-cfg <path>` or place it at ~/.config/moneta.conf
+
+```ini
+wallet=/wallet/dir/walletfile
+password=password
+daemon=http://xmr-node.cakewallet.com:18081
+contact=Name:Address
+```
+
 ## Usage
 
 ```
